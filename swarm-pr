@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+"""
+Swarm-PR: Loop autônomo Actor-Critic com isolamento de contexto (estilo SwarmForge).
+Obtém harnesses, modelos e reasoning efforts DINAMICAMENTE direto das CLIs instaladas.
+Exibe logs e andamento em tempo real (Live UI) e valida estado do Git/PR com segurança.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# Desativa timeout de tarefas em background no Claude Code
+os.environ["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"
+
+CONFIG_DIR = os.path.expanduser("~/.config/swarm-pr")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "last_config.json")
+
+# Padrões a ignorar no diff para economizar contexto
+DIFF_EXCLUDES = [
+    ":!*package-lock.json",
+    ":!*yarn.lock",
+    ":!*pnpm-lock.yaml",
+    ":!*Cargo.lock",
+    ":!*poetry.lock",
+    ":!*Gemfile.lock",
+    ":!*composer.lock",
+    ":!*.min.js",
+    ":!*.min.css",
+    ":!*.map",
+]
+
+class Colors:
+    BOLD = "\033[1m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    DIM = "\033[2m"
+    MAGENTA = "\033[35m"
+    BLUE = "\033[34m"
+    RESET = "\033[0m"
+
+def log(icon, msg):
+    print(f"{icon}  {msg}", flush=True)
+
+def run_cmd(cmd_list, check=True, capture=True):
+    try:
+        res = subprocess.run(
+            cmd_list,
+            text=True,
+            capture_output=capture,
+            check=check
+        )
+        return res.stdout.strip() if capture else ""
+    except subprocess.CalledProcessError as e:
+        if capture:
+            log("❌", f"Erro ao executar {' '.join(cmd_list)}:\n{e.stderr.strip() if e.stderr else e.stdout.strip()}")
+        if check:
+            raise e
+        return ""
+
+def is_git_repo():
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True
+        )
+        return res.returncode == 0 and res.stdout.strip() == "true"
+    except FileNotFoundError:
+        return False
+
+def get_default_branch():
+    try:
+        ref = run_cmd(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], check=False)
+        if ref:
+            return ref.split("/")[-1]
+    except Exception:
+        pass
+    for candidate in ["main", "master"]:
+        res = subprocess.run(["git", "rev-parse", "--verify", candidate], capture_output=True)
+        if res.returncode == 0:
+            return candidate
+    return "main"
+
+def slugify(text):
+    slug = re.sub(r"[^\w\s-]", "", text.lower())
+    slug = re.sub(r"[\s_]+", "-", slug).strip("-")
+    return slug[:40] or "task"
+
+def get_filtered_diff(base_branch):
+    cmd = ["git", "diff", f"{base_branch}...HEAD", "--"] + DIFF_EXCLUDES
+    try:
+        return run_cmd(cmd, check=False)
+    except Exception:
+        return run_cmd(["git", "diff", f"origin/{base_branch}...HEAD", "--"] + DIFF_EXCLUDES, check=False)
+
+def load_last_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_last_config(cfg):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+# ==============================================================================
+# Execução com Live Streaming e UI em Tempo Real
+# ==============================================================================
+
+def stream_agent_execution(cmd, harness_name, is_claude_json=False):
+    """
+    Executa o agente exibindo o progresso ao vivo na tela linha a linha.
+    Para o Claude, decodifica o stream JSON para mostrar chamadas de ferramentas e pensamentos.
+    Retorna o texto final acumulado do agente.
+    """
+    env = os.environ.copy()
+    env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"
+
+    print(f"{Colors.DIM}┌── Iniciando processo: {' '.join(cmd[:4])}...{Colors.RESET}", flush=True)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env
+    )
+
+    accumulated_text = []
+
+    for line in proc.stdout:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+
+        if is_claude_json and line_clean.startswith("{") and line_clean.endswith("}"):
+            try:
+                data = json.loads(line_clean)
+                event_type = data.get("type")
+
+                if event_type == "assistant":
+                    msg = data.get("message", {})
+                    for c in msg.get("content", []):
+                        ct = c.get("type")
+                        if ct == "tool_use":
+                            tool_name = c.get("name", "Tool")
+                            inp = c.get("input", {})
+                            if tool_name == "Bash":
+                                cmd_run = inp.get("command", "")
+                                print(f"{Colors.YELLOW}⚙️  [{harness_name}] ❯ {cmd_run[:120]}{Colors.RESET}", flush=True)
+                            elif tool_name in ["Edit", "Write"]:
+                                path = inp.get("file_path", "")
+                                print(f"{Colors.BLUE}📝 [{harness_name}] Editando: {path}{Colors.RESET}", flush=True)
+                            elif tool_name == "Read":
+                                path = inp.get("file_path", "")
+                                print(f"{Colors.DIM}📖 [{harness_name}] Lendo: {path}{Colors.RESET}", flush=True)
+                            else:
+                                print(f"{Colors.CYAN}🔧 [{harness_name}: {tool_name}] {str(inp)[:80]}{Colors.RESET}", flush=True)
+                        elif ct == "text":
+                            txt = c.get("text", "")
+                            accumulated_text.append(txt)
+                            print(f"{Colors.GREEN}💬 [{harness_name}]{Colors.RESET} {txt}", flush=True)
+
+                elif event_type == "user":
+                    msg = data.get("message", {})
+                    for c in msg.get("content", []):
+                        if c.get("type") == "tool_result":
+                            res_str = str(c.get("content", ""))
+                            first_line = res_str.splitlines()[0] if res_str else ""
+                            if first_line:
+                                print(f"{Colors.DIM}   └─ {first_line[:100]}{Colors.RESET}", flush=True)
+
+                elif event_type == "system" and data.get("subtype") == "thinking_tokens":
+                    # Indicador de raciocínio
+                    print(f"{Colors.DIM}💭 [{harness_name}] Raciocinando...{Colors.RESET}", end="\r", flush=True)
+
+                continue
+            except Exception:
+                pass
+
+        # Linhas de texto comuns (ex: cursor-agent, codex ou fallback)
+        accumulated_text.append(line)
+        print(f"{Colors.DIM}[{harness_name}]{Colors.RESET} {line_clean}", flush=True)
+
+    proc.wait()
+    print(f"{Colors.DIM}└── Processo encerrado (código: {proc.returncode}){Colors.RESET}\n", flush=True)
+    return proc.returncode, "".join(accumulated_text).strip()
+
+# ==============================================================================
+# Descoberta Dinâmica de Modelos
+# ==============================================================================
+
+def detect_harnesses():
+    found = {}
+    candidates = [
+        ("claude-w", ["claude-w", "claude"]),
+        ("cursor-agent", ["cursor-agent", "agent"]),
+        ("codex", ["codex"]),
+        ("opencode", ["opencode"]),
+    ]
+    for key, binaries in candidates:
+        for b in binaries:
+            path = shutil.which(b)
+            if path:
+                found[key] = path
+                break
+    return found
+
+def get_real_claude_binary():
+    c = shutil.which("claude-w") or shutil.which("claude")
+    if not c:
+        return None
+    try:
+        with open(c, "rb") as f:
+            content = f.read(500)
+            if b"#!/bin" in content:
+                res = subprocess.run(["mise", "which", "claude"], capture_output=True, text=True)
+                if res.returncode == 0 and res.stdout.strip():
+                    return res.stdout.strip()
+    except Exception:
+        pass
+    return c
+
+def fetch_claude_models_dynamically():
+    models = set(["sonnet", "opus", "fable", "haiku"])
+    for conf_path in [os.path.expanduser("~/.claude/settings.json"), os.path.expanduser("~/.claude-w/config.json")]:
+        if os.path.exists(conf_path):
+            try:
+                with open(conf_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for m in data.get("modelSettings", {}).keys():
+                        models.add(m)
+            except Exception:
+                pass
+
+    bin_path = get_real_claude_binary()
+    if bin_path and os.path.exists(bin_path):
+        try:
+            res = subprocess.run(["strings", bin_path], capture_output=True, text=True)
+            matches = re.findall(r'(claude-(?:sonnet|opus|haiku|fable)-[0-9a-zA-Z\.\-]+)', res.stdout)
+            for m in matches:
+                cleaned = re.sub(r'[^0-9a-zA-Z\.\-]+$', '', m)
+                if not any(x in cleaned for x in ["example", "test", "schema", "@"]):
+                    base = re.sub(r'-[0-9]{8}(-v[0-9]+)?$', '', cleaned)
+                    base = re.sub(r'-v[0-9]+$', '', base)
+                    if len(base) > 8:
+                        models.add(base)
+        except Exception:
+            pass
+
+    return sorted(list(models))
+
+def fetch_cursor_models(binary):
+    try:
+        res = subprocess.run([binary, "--list-models"], capture_output=True, text=True, check=True)
+        all_models = {}
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("Tip:"):
+                continue
+            parts = line.split(" - ", 1)
+            if len(parts) == 2:
+                all_models[parts[0].strip()] = parts[1].strip()
+        return all_models
+    except Exception as e:
+        log("⚠️", f"Falha ao consultar modelos do cursor-agent: {e}")
+        return {}
+
+def fetch_opencode_models(binary):
+    try:
+        res = subprocess.run([binary, "models"], capture_output=True, text=True, check=True)
+        models = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if line and not line.startswith(("mise", "opencode@", "█", "▀")):
+                models.append(line)
+        return models
+    except Exception as e:
+        log("⚠️", f"Falha ao consultar modelos do opencode: {e}")
+        return []
+
+def fetch_codex_default_model():
+    config_path = os.path.expanduser("~/.codex/config.toml")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                m = re.search(r'model\s*=\s*"([^"]+)"', content)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+    return "gpt-5.6-luna"
+
+# ==============================================================================
+# Menus Interativos Dinâmicos
+# ==============================================================================
+
+def select_claude_model_dynamically(default_model):
+    all_models = fetch_claude_models_dynamically()
+    if not all_models:
+        all_models = ["sonnet", "opus", "fable", "claude-sonnet-5", "claude-opus-5"]
+
+    priority = [
+        "sonnet",
+        "opus",
+        "fable",
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-fable-5-1",
+        "claude-haiku-4-5"
+    ]
+    base_options = [p for p in priority if p in all_models]
+    for m in all_models:
+        if m not in base_options:
+            base_options.append(m)
+
+    featured = base_options[:8]
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}Selecione o Modelo para Claude Code (extraídos dinamicamente da CLI):{Colors.RESET}")
+    for i, opt in enumerate(featured):
+        marker = f"{Colors.GREEN}[Padrão]{Colors.RESET}" if opt == default_model else ""
+        print(f"  {Colors.BOLD}[{i+1}]{Colors.RESET} {opt} {marker}")
+
+    search_idx = len(featured) + 1
+    custom_idx = len(featured) + 2
+    print(f"  {Colors.BOLD}[{search_idx}]{Colors.RESET} 🔍 Buscar / Filtrar todos os {len(all_models)} modelos da CLI do Claude")
+    print(f"  {Colors.BOLD}[{custom_idx}]{Colors.RESET} Digitar qualquer nome/alias de modelo manualmente")
+
+    while True:
+        try:
+            choice = input(f"Escolha [padrão: {default_model}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelado.")
+            sys.exit(1)
+
+        if not choice:
+            return default_model
+
+        if choice.isdigit():
+            val = int(choice)
+            if 1 <= val <= len(featured):
+                return featured[val - 1]
+            elif val == search_idx:
+                term = input("Termo de busca (ex: opus, sonnet, fable, 4-8): ").strip().lower()
+                matches = [m for m in all_models if term in m.lower()]
+                if not matches:
+                    print(f"{Colors.YELLOW}Nenhum modelo encontrado com '{term}'.{Colors.RESET}")
+                    continue
+                print(f"\n{Colors.BOLD}Modelos encontrados ({len(matches)}):{Colors.RESET}")
+                for j, m in enumerate(matches[:20]):
+                    print(f"  {Colors.BOLD}[{j+1}]{Colors.RESET} {m}")
+                sub_choice = input(f"Escolha o número (1-{min(len(matches), 20)}): ").strip()
+                if sub_choice.isdigit() and 1 <= int(sub_choice) <= len(matches):
+                    return matches[int(sub_choice) - 1]
+                continue
+            elif val == custom_idx:
+                custom_id = input("Digite o nome ou ID do modelo: ").strip()
+                if custom_id:
+                    return custom_id
+                continue
+
+        if choice in all_models:
+            return choice
+
+        print(f"{Colors.RED}Opção inválida.{Colors.RESET}")
+
+def select_cursor_model_dynamically(binary, default_model):
+    all_models = fetch_cursor_models(binary)
+    if not all_models:
+        choice = input(f"Modelo para cursor-agent [padrão: {default_model}]: ").strip()
+        return choice or default_model
+
+    popular_bases = [
+        "cursor-grok-4.6",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        "gemini-3.8-flash",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "kimi-k3",
+        "auto"
+    ]
+    base_options = [b for b in popular_bases if any(b in m_id for m_id in all_models)]
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}Selecione o Modelo para cursor-agent (detectados via CLI):{Colors.RESET}")
+    for i, opt in enumerate(base_options):
+        marker = f"{Colors.GREEN}[Padrão]{Colors.RESET}" if opt == default_model else ""
+        print(f"  {Colors.BOLD}[{i+1}]{Colors.RESET} {opt} {marker}")
+
+    search_idx = len(base_options) + 1
+    custom_idx = len(base_options) + 2
+    print(f"  {Colors.BOLD}[{search_idx}]{Colors.RESET} 🔍 Buscar / Filtrar todos os {len(all_models)} modelos da CLI")
+    print(f"  {Colors.BOLD}[{custom_idx}]{Colors.RESET} Digitar qualquer ID de modelo manualmente")
+
+    while True:
+        try:
+            choice = input(f"Escolha [padrão: {default_model}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelado.")
+            sys.exit(1)
+
+        if not choice:
+            return default_model
+
+        if choice.isdigit():
+            val = int(choice)
+            if 1 <= val <= len(base_options):
+                return base_options[val - 1]
+            elif val == search_idx:
+                term = input("Termo de busca (ex: grok, sonnet, gemini, opus): ").strip().lower()
+                matches = [(m_id, desc) for m_id, desc in all_models.items() if term in m_id.lower() or term in desc.lower()]
+                if not matches:
+                    print(f"{Colors.YELLOW}Nenhum modelo encontrado com '{term}'.{Colors.RESET}")
+                    continue
+                print(f"\n{Colors.BOLD}Modelos encontrados ({len(matches)}):{Colors.RESET}")
+                for j, (m_id, desc) in enumerate(matches[:25]):
+                    print(f"  {Colors.BOLD}[{j+1}]{Colors.RESET} {m_id} {Colors.DIM}({desc}){Colors.RESET}")
+                if len(matches) > 25:
+                    print(f"  {Colors.DIM}... e mais {len(matches) - 25} modelos.{Colors.RESET}")
+                sub_choice = input(f"Escolha o número (1-{min(len(matches), 25)}): ").strip()
+                if sub_choice.isdigit() and 1 <= int(sub_choice) <= len(matches):
+                    return matches[int(sub_choice) - 1][0]
+                continue
+            elif val == custom_idx:
+                custom_id = input("Digite o ID do modelo: ").strip()
+                if custom_id:
+                    return custom_id
+                continue
+
+        if choice in all_models or any(choice in m for m in all_models):
+            return choice
+
+        print(f"{Colors.RED}Opção inválida.{Colors.RESET}")
+
+def resolve_cursor_model_id(binary, model_choice, effort):
+    all_models = fetch_cursor_models(binary)
+    if not all_models:
+        return model_choice
+
+    if model_choice in all_models:
+        return model_choice
+
+    candidate = f"{model_choice}-{effort}"
+    if candidate in all_models:
+        return candidate
+
+    candidate_thinking = f"{model_choice}-thinking-{effort}"
+    if candidate_thinking in all_models:
+        return candidate_thinking
+
+    return f"{model_choice}[effort={effort}]"
+
+def select_opencode_model_dynamically(binary, default_model):
+    all_models = fetch_opencode_models(binary)
+    if not all_models:
+        choice = input(f"Modelo para opencode [padrão: {default_model}]: ").strip()
+        return choice or default_model
+
+    sample_models = [m for m in all_models if any(k in m for k in ["grok", "gemini-3", "gpt-5", "claude"])]
+    if not sample_models:
+        sample_models = all_models[:8]
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}Selecione o Modelo para opencode:{Colors.RESET}")
+    for i, opt in enumerate(sample_models):
+        marker = f"{Colors.GREEN}[Padrão]{Colors.RESET}" if opt == default_model else ""
+        print(f"  {Colors.BOLD}[{i+1}]{Colors.RESET} {opt} {marker}")
+
+    search_idx = len(sample_models) + 1
+    print(f"  {Colors.BOLD}[{search_idx}]{Colors.RESET} 🔍 Buscar / Filtrar todos os {len(all_models)} modelos do opencode")
+
+    while True:
+        try:
+            choice = input(f"Escolha [padrão: {default_model}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelado.")
+            sys.exit(1)
+
+        if not choice:
+            return default_model
+
+        if choice.isdigit():
+            val = int(choice)
+            if 1 <= val <= len(sample_models):
+                return sample_models[val - 1]
+            elif val == search_idx:
+                term = input("Termo de busca: ").strip().lower()
+                matches = [m for m in all_models if term in m.lower()]
+                if not matches:
+                    print(f"{Colors.YELLOW}Nenhum modelo encontrado com '{term}'.{Colors.RESET}")
+                    continue
+                for j, m in enumerate(matches[:20]):
+                    print(f"  {Colors.BOLD}[{j+1}]{Colors.RESET} {m}")
+                sub = input(f"Escolha (1-{min(len(matches), 20)}): ").strip()
+                if sub.isdigit() and 1 <= int(sub) <= len(matches):
+                    return matches[int(sub) - 1]
+                continue
+        if choice in all_models:
+            return choice
+        print(f"{Colors.RED}Opção inválida.{Colors.RESET}")
+
+def configure_agent_role(role_name, default_harness, harnesses, last_cfg):
+    print(f"\n{Colors.BOLD}{'='*15} CONFIGURAÇÃO: {role_name.upper()} {'='*15}{Colors.RESET}")
+
+    saved_harness = last_cfg.get(f"{role_name}_harness", default_harness)
+    if saved_harness not in harnesses:
+        saved_harness = list(harnesses.keys())[0]
+
+    harness_list = list(harnesses.keys())
+    print(f"\n{Colors.BOLD}{Colors.CYAN}Selecione o Harness/CLI para {role_name}:{Colors.RESET}")
+    for i, h in enumerate(harness_list):
+        marker = f"{Colors.GREEN}[Padrão]{Colors.RESET}" if h == saved_harness else ""
+        print(f"  {Colors.BOLD}[{i+1}]{Colors.RESET} {h} {marker}")
+
+    while True:
+        try:
+            choice = input(f"Escolha [padrão: {saved_harness}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelado.")
+            sys.exit(1)
+
+        if not choice:
+            chosen_harness = saved_harness
+            break
+        if choice.isdigit() and 1 <= int(choice) <= len(harness_list):
+            chosen_harness = harness_list[int(choice) - 1]
+            break
+        if choice in harness_list:
+            chosen_harness = choice
+            break
+        print(f"{Colors.RED}Opção inválida.{Colors.RESET}")
+
+    binary = harnesses[chosen_harness]
+    saved_model = last_cfg.get(f"{role_name}_model", "")
+    chosen_effort = "medium"
+
+    if chosen_harness in ["claude-w", "claude"]:
+        def_model = saved_model or "sonnet"
+        chosen_model = select_claude_model_dynamically(def_model)
+
+        efforts = ["low", "medium", "high", "max"]
+        saved_eff = last_cfg.get(f"{role_name}_effort", "medium")
+        print(f"\n{Colors.BOLD}{Colors.CYAN}Nível de Esforço (Claude --effort):{Colors.RESET}")
+        for i, eff in enumerate(efforts):
+            marker = f"{Colors.GREEN}[Padrão]{Colors.RESET}" if eff == saved_eff else ""
+            print(f"  {Colors.BOLD}[{i+1}]{Colors.RESET} {eff} {marker}")
+        eff_choice = input(f"Escolha [padrão: {saved_eff}]: ").strip()
+        if eff_choice.isdigit() and 1 <= int(eff_choice) <= len(efforts):
+            chosen_effort = efforts[int(eff_choice) - 1]
+        elif eff_choice in efforts:
+            chosen_effort = eff_choice
+        else:
+            chosen_effort = saved_eff
+
+    elif chosen_harness in ["cursor-agent", "agent"]:
+        def_model = saved_model or "cursor-grok-4.6"
+        chosen_model_base = select_cursor_model_dynamically(binary, def_model)
+
+        if any(chosen_model_base.endswith(f"-{eff}") for eff in ["low", "medium", "high", "xhigh", "max"]):
+            chosen_model = chosen_model_base
+            chosen_effort = chosen_model_base.split("-")[-1]
+        else:
+            print(f"\n{Colors.BOLD}{Colors.CYAN}Nível de Esforço (Reasoning / Thinking Effort):{Colors.RESET}")
+            efforts = ["low", "medium", "high", "xhigh", "max"]
+            saved_eff = last_cfg.get(f"{role_name}_effort", "medium")
+            for i, eff in enumerate(efforts):
+                marker = f"{Colors.GREEN}[Padrão]{Colors.RESET}" if eff == saved_eff else ""
+                print(f"  {Colors.BOLD}[{i+1}]{Colors.RESET} {eff} {marker}")
+            eff_choice = input(f"Escolha [padrão: {saved_eff}]: ").strip()
+            if eff_choice.isdigit() and 1 <= int(eff_choice) <= len(efforts):
+                chosen_effort = efforts[int(eff_choice) - 1]
+            elif eff_choice in efforts:
+                chosen_effort = eff_choice
+            else:
+                chosen_effort = saved_eff
+            chosen_model = resolve_cursor_model_id(binary, chosen_model_base, chosen_effort)
+
+    elif chosen_harness == "opencode":
+        def_model = saved_model or "opencode-go/grok-4.6"
+        chosen_model = select_opencode_model_dynamically(binary, def_model)
+        chosen_effort = "default"
+
+    elif chosen_harness == "codex":
+        active_model = fetch_codex_default_model()
+        codex_models = [active_model, "o3", "o4-mini", "gpt-5.5"]
+        def_model = saved_model or active_model
+        print(f"\n{Colors.BOLD}{Colors.CYAN}Selecione o Modelo para Codex (configurado: {active_model}):{Colors.RESET}")
+        for i, m in enumerate(codex_models):
+            marker = f"{Colors.GREEN}[Padrão]{Colors.RESET}" if m == def_model else ""
+            print(f"  {Colors.BOLD}[{i+1}]{Colors.RESET} {m} {marker}")
+        c_choice = input(f"Escolha [padrão: {def_model}]: ").strip()
+        chosen_model = codex_models[int(c_choice)-1] if c_choice.isdigit() and 1 <= int(c_choice) <= len(codex_models) else (c_choice or def_model)
+        chosen_effort = "medium"
+
+    return {
+        "harness": chosen_harness,
+        "binary": binary,
+        "model": chosen_model,
+        "effort": chosen_effort
+    }
+
+# ==============================================================================
+# Execução dos Agentes com Streaming
+# ==============================================================================
+
+def dispatch_coder(coder_cfg, task_description, branch_name):
+    harness = coder_cfg["harness"]
+    binary = coder_cfg["binary"]
+    model = coder_cfg["model"]
+    effort = coder_cfg["effort"]
+
+    log("🚀", f"[{harness}] Implementando tarefa com modelo '{model}' (effort={effort})...")
+
+    prompt = f"""
+Você é o engenheiro responsável por implementar e ENTREGAR esta tarefa:
+"{task_description}"
+
+INSTRUÇÕES CRÍTICAS DE EXECUÇÃO:
+1. Você DEVE implementar código real nos arquivos do projeto. NÃO apenas explique ou planeje.
+2. Crie ou altere todos os arquivos necessários.
+3. Se rodar servidores ou processos em background durante os testes, ENCERRE-OS antes de finalizar.
+4. Ao concluir as alterações de código, você DEVE fazer:
+   git add -A
+   git commit -m "feat: {task_description[:50]}"
+   git push -u origin {branch_name}
+5. O PR só poderá ser aberto se houver commits reais criados e enviados para a branch remota.
+"""
+    is_claude = harness in ["claude-w", "claude"]
+    if is_claude:
+        cmd = [binary, "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json", "-p", prompt, "--model", model]
+        if effort != "default":
+            cmd += ["--effort", effort]
+    elif harness in ["cursor-agent", "agent"]:
+        cmd = [binary, "-p", "--force", "--model", model, prompt]
+    elif harness == "codex":
+        cmd = [binary, "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", model]
+        if effort != "default":
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
+        cmd.append(prompt)
+    elif harness == "opencode":
+        cmd = [binary, "run", "--auto", "-m", model, prompt]
+    else:
+        cmd = [binary, prompt]
+
+    retcode, _ = stream_agent_execution(cmd, harness, is_claude_json=is_claude)
+    if retcode != 0:
+        log("❌", f"{harness} encerrou com erro ({retcode}) na implementação.")
+        sys.exit(retcode)
+
+def dispatch_reviewer(reviewer_cfg, task_description, diff_content):
+    harness = reviewer_cfg["harness"]
+    binary = reviewer_cfg["binary"]
+    model = reviewer_cfg["model"]
+    effort = reviewer_cfg["effort"]
+
+    log("🔍", f"[{harness}] Realizando code review com modelo '{model}' (effort={effort})...")
+
+    max_diff_len = 50000
+    if len(diff_content) > max_diff_len:
+        diff_content = diff_content[:max_diff_len] + "\n\n[... Diff truncado devido ao limite de contexto ...]"
+
+    prompt = f"""
+Você é um Code Reviewer rigoroso. Analise este diff referente à tarefa:
+"{task_description}"
+
+DIFF:
+```diff
+{diff_content}
+```
+
+REGRAS:
+1. Analise exclusivamente bugs reais, segurança, regressões, tipagem e performance.
+2. Não comente sobre estilo puramente subjetivo se o código estiver limpo.
+3. Seja conciso e direto.
+4. Se o código estiver aprovado e pronto para merge, responda EXATAMENTE:
+STATUS: APPROVED
+
+5. Se houver problemas a corrigir, responda no formato:
+STATUS: CHANGES_REQUESTED
+- [Arquivo:Linha]: <problema específico e recomendação objetiva>
+"""
+    is_claude = harness in ["claude-w", "claude"]
+    if harness in ["cursor-agent", "agent"]:
+        cmd = [binary, "-p", "--mode", "ask", "--model", model, prompt]
+    elif is_claude:
+        cmd = [binary, "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json", "-p", prompt, "--model", model]
+        if effort != "default":
+            cmd += ["--effort", effort]
+    elif harness == "codex":
+        cmd = [binary, "exec", "-s", "read-only", "-m", model]
+        if effort != "default":
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
+        cmd.append(prompt)
+    elif harness == "opencode":
+        cmd = [binary, "run", "-m", model, prompt]
+    else:
+        cmd = [binary, prompt]
+
+    _, output = stream_agent_execution(cmd, harness, is_claude_json=is_claude)
+    return output
+
+def dispatch_refiner(coder_cfg, review_feedback, task_description, branch_name):
+    harness = coder_cfg["harness"]
+    binary = coder_cfg["binary"]
+    model = coder_cfg["model"]
+    effort = coder_cfg["effort"]
+
+    log("🛠️", f"[{harness}] Avaliando apontamentos e aplicando correções...")
+
+    prompt = f"""
+Você é o autor do PR para a tarefa: "{task_description}".
+O Code Reviewer enviou as seguintes observações técnicas:
+
+\"\"\"{review_feedback}\"\"\"
+
+Instruções:
+1. Avalie criticamente cada apontamento.
+2. Se for tecnicamente válido, corrija o código imediatamente.
+3. Se algum apontamento for equivocado ou falso-positivo, ignore-o.
+4. Rode testes se aplicável.
+5. Faça:
+   git add -A
+   git commit -m "fix: address code review feedback"
+   git push origin {branch_name}
+6. Responda apenas com um breve resumo das correções feitas ou justificativas.
+"""
+    is_claude = harness in ["claude-w", "claude"]
+    if is_claude:
+        cmd = [binary, "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json", "-p", prompt, "--model", model]
+        if effort != "default":
+            cmd += ["--effort", effort]
+    elif harness in ["cursor-agent", "agent"]:
+        cmd = [binary, "-p", "--force", "--model", model, prompt]
+    elif harness == "codex":
+        cmd = [binary, "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", model]
+        if effort != "default":
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
+        cmd.append(prompt)
+    elif harness == "opencode":
+        cmd = [binary, "run", "--auto", "-m", model, prompt]
+    else:
+        cmd = [binary, prompt]
+
+    retcode, _ = stream_agent_execution(cmd, harness, is_claude_json=is_claude)
+    if retcode != 0:
+        log("❌", f"{harness} encerrou com erro ao aplicar correções.")
+        sys.exit(retcode)
+
+# ==============================================================================
+# Gestão Segura de Pull Request no Git e GitHub
+# ==============================================================================
+
+def ensure_pr_exists(task_description, branch_name, base_branch):
+    """
+    Garante que:
+    1. Mudanças não commitadas sejam salvas.
+    2. Existam commits entre base e head (evitando crash no GraphQL da gh CLI).
+    3. A branch seja enviada para o GitHub (git push).
+    4. O PR seja criado ou reutilizado.
+    """
+    # 1. Verifica se o agente deixou alterações soltas sem commit
+    uncommitted = run_cmd(["git", "status", "--porcelain"], check=False)
+    if uncommitted:
+        log("⚠️", "Arquivos modificados detectados sem commit. Fazendo commit automático...")
+        run_cmd(["git", "add", "-A"], check=False)
+        run_cmd(["git", "commit", "-m", f"feat: {task_description[:50]}"], check=False)
+
+    # 2. Verifica se há pelo menos 1 commit à frente da base
+    commits_ahead = run_cmd(["git", "rev-list", "--count", f"{base_branch}..HEAD"], check=False)
+    if not commits_ahead or commits_ahead.strip() == "0":
+        commits_ahead = run_cmd(["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"], check=False)
+
+    if not commits_ahead or commits_ahead.strip() == "0":
+        log("❌", f"Nenhum commit foi encontrado na branch '{branch_name}' em relação à '{base_branch}'.")
+        log("⚠️", "O agente concluiu sem criar commits com alterações reais de código.")
+        log("💡", "O GitHub exige pelo menos 1 commit de diferença para poder abrir um Pull Request.")
+        return None
+
+    # 3. Garante que a branch existe no remote (git push)
+    log("⬆️", f"Sincronizando branch com o GitHub (git push -u origin {branch_name})...")
+    push_res = subprocess.run(["git", "push", "-u", "origin", branch_name], capture_output=True, text=True)
+    if push_res.returncode != 0:
+        log("⚠️", f"Aviso no git push: {push_res.stderr.strip() or push_res.stdout.strip()}")
+
+    # 4. Verifica se PR já existe
+    existing = run_cmd(["gh", "pr", "view", "--json", "url", "-q", ".url"], check=False)
+    if existing and existing.startswith("http"):
+        log("📌", f"Pull Request já existente detectado: {existing}")
+        return existing
+
+    # 5. Criação do Pull Request
+    log("📝", "Criando Pull Request via gh CLI...")
+    title = f"feat: {task_description[:60]}"
+    body = (
+        f"## Task Description\n{task_description}\n\n"
+        f"Automated PR created by `swarm-pr` loop."
+    )
+    cmd = [
+        "gh", "pr", "create",
+        "--title", title,
+        "--body", body,
+        "--head", branch_name,
+        "--base", base_branch
+    ]
+    try:
+        pr_url = run_cmd(cmd, check=True)
+        log("🔗", f"Pull Request criado com sucesso: {pr_url}")
+        return pr_url
+    except Exception as e:
+        log("❌", f"Falha ao criar PR via gh CLI: {e}")
+        return None
+
+# ==============================================================================
+# Loop Principal
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Swarm-PR: Loop autônomo Coder <-> Reviewer com Live UI e descoberta dinâmica."
+    )
+    parser.add_argument("task", nargs="?", help="Descrição da tarefa a ser executada")
+    parser.add_argument("--branch", help="Nome da branch git (padrão: swarm/<task-slug>)")
+    parser.add_argument("--base", help="Branch base (padrão: detecta main/master)")
+    parser.add_argument("--max-iter", type=int, default=3, help="Máximo de ciclos de review (padrão: 3)")
+    parser.add_argument("--skip-initial", action="store_true", help="Pular implementação inicial e iniciar direto pelo review")
+    parser.add_argument("-y", "--yes", action="store_true", help="Aceitar defaults automaticamente sem perguntas interativas")
+
+    args = parser.parse_args()
+
+    if not is_git_repo():
+        log("❌", "Erro: O comando deve ser executado dentro de um repositório Git.")
+        sys.exit(1)
+
+    harnesses = detect_harnesses()
+    if not harnesses:
+        log("❌", "Nenhum CLI/harness compatível encontrado no sistema!")
+        sys.exit(1)
+
+    task = args.task
+    if not task:
+        try:
+            task = input(f"{Colors.BOLD}Digite a descrição da tarefa: {Colors.RESET}").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
+        if not task:
+            log("❌", "A descrição da tarefa é obrigatória.")
+            sys.exit(1)
+
+    last_cfg = load_last_config()
+
+    if not args.yes and sys.stdin.isatty():
+        coder_cfg = configure_agent_role("coder", "claude-w", harnesses, last_cfg)
+        reviewer_cfg = configure_agent_role("reviewer", "cursor-agent", harnesses, last_cfg)
+        
+        save_last_config({
+            "coder_harness": coder_cfg["harness"],
+            "coder_model": coder_cfg["model"],
+            "coder_effort": coder_cfg["effort"],
+            "reviewer_harness": reviewer_cfg["harness"],
+            "reviewer_model": reviewer_cfg["model"],
+            "reviewer_effort": reviewer_cfg["effort"]
+        })
+    else:
+        def_c = "claude-w" if "claude-w" in harnesses else list(harnesses.keys())[0]
+        def_r = "cursor-agent" if "cursor-agent" in harnesses else list(harnesses.keys())[0]
+        
+        c_h = last_cfg.get("coder_harness", def_c)
+        coder_cfg = {
+            "harness": c_h,
+            "binary": harnesses[c_h],
+            "model": last_cfg.get("coder_model", "sonnet" if c_h == "claude-w" else "cursor-grok-4.6"),
+            "effort": last_cfg.get("coder_effort", "medium")
+        }
+        r_h = last_cfg.get("reviewer_harness", def_r)
+        reviewer_cfg = {
+            "harness": r_h,
+            "binary": harnesses[r_h],
+            "model": last_cfg.get("reviewer_model", "cursor-grok-4.6" if r_h == "cursor-agent" else "sonnet"),
+            "effort": last_cfg.get("reviewer_effort", "medium")
+        }
+
+    base_branch = args.base or get_default_branch()
+    branch_name = args.branch or f"swarm/{slugify(task)}"
+
+    print(f"\n{Colors.BOLD}{Colors.GREEN}Resumo da Sessão Swarm-PR:{Colors.RESET}")
+    print(f"  📌 Branch:   {branch_name} (base: {base_branch})")
+    print(f"  🔨 Coder:    {coder_cfg['harness']} | Modelo: {coder_cfg['model']} | Effort: {coder_cfg['effort']}")
+    print(f"  🧐 Reviewer: {reviewer_cfg['harness']} | Modelo: {reviewer_cfg['model']} | Effort: {reviewer_cfg['effort']}")
+    print(f"  🔄 Max Iter: {args.max_iter}\n")
+
+    if not args.skip_initial:
+        log("🌿", f"Criando/alternando para branch '{branch_name}'...")
+        run_cmd(["git", "checkout", "-B", branch_name], check=False)
+
+        # 1. Coder implementa com streaming ao vivo
+        dispatch_coder(coder_cfg, task, branch_name)
+
+        # 2. Assegura commits, push e criação do PR
+        pr_url = ensure_pr_exists(task, branch_name, base_branch)
+        if not pr_url:
+            log("🛑", "Execução interrompida: o Pull Request não pôde ser aberto.")
+            log("👉", "Verifique se o Coder gerou commits reais no repositório antes de abrir a PR.")
+            sys.exit(1)
+    else:
+        log("⏩", "Pulando implementação inicial. Usando estado atual do branch.")
+
+    # 3. Loop de Revisão (Actor-Critic)
+    for iteration in range(1, args.max_iter + 1):
+        print("\n" + "=" * 50)
+        log("🔄", f"Ciclo de Revisão {iteration}/{args.max_iter}")
+        print("=" * 50)
+
+        diff = get_filtered_diff(base_branch)
+        if not diff:
+            log("⚠️", "Nenhum diff encontrado em relação à branch base. Encerrando.")
+            break
+
+        review_result = dispatch_reviewer(reviewer_cfg, task, diff)
+
+        print(f"\n------------------- Feedback do {reviewer_cfg['harness']} -------------------")
+        print(review_result.strip())
+        print("-" * 65 + "\n")
+
+        if re.search(r"STATUS:\s*\[?APPROVED\]?", review_result, re.IGNORECASE):
+            log("🎉", f"Código APROVADO pelo {reviewer_cfg['harness']}! PR validado e pronto para merge.")
+            try:
+                run_cmd([
+                    "gh", "pr", "comment",
+                    "--body", f"✅ Code review aprovado automaticamente pelo {reviewer_cfg['harness']} ({reviewer_cfg['model']}) no ciclo {iteration}."
+                ], check=False)
+            except Exception:
+                pass
+            return
+
+        if iteration < args.max_iter:
+            dispatch_refiner(coder_cfg, review_result, task, branch_name)
+        else:
+            log("⚠️", f"Limite de {args.max_iter} iterações atingido.")
+            log("👉", "Os apontamentos restantes requerem validação manual humana.")
+
+if __name__ == "__main__":
+    main()
