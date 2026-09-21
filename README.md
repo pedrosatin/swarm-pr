@@ -1,48 +1,71 @@
 # Swarm-PR
 
-Loop autônomo **Coder ↔ Reviewer** com isolamento de contexto (estilo SwarmForge).
+An autonomous Coder ↔ Reviewer loop with context isolation (SwarmForge-style).
 
-Escolhe harness/modelo/reasoning effort dinamicamente a partir das CLIs instaladas, mostra progresso em tempo real e valida o estado do Git/PR.
+Swarm-PR picks a harness, model, and reasoning effort dynamically from whichever CLIs are installed on your machine. It streams the agents' progress live and checks the Git/PR state before opening a pull request.
 
-## Requisitos
+## How it works
+
+1. A "coder" agent implements the task on a new branch and pushes its commits.
+2. Swarm-PR opens (or reuses) a pull request via `gh`.
+3. A "reviewer" agent reviews the diff against the base branch.
+4. If changes are requested, the coder addresses the feedback and pushes again.
+5. This review cycle repeats until the reviewer approves or `--max-iter` is reached.
+
+Swarm-PR supports multiple harnesses as coder or reviewer, detected dynamically via `PATH`:
+
+- `claude-w` / `claude` (Claude Code)
+- `cursor-agent` / `agent` (Cursor CLI)
+- `codex` (Codex CLI)
+- `opencode`
+
+For each harness it queries the installed CLI for its available models, and reasoning-effort levels where applicable, instead of hardcoding a model list. That way the menu stays current as new models ship.
+
+## Requirements
 
 - Python 3
 - `git`
-- Pelo menos um harness no `PATH`: `claude` / `claude-w`, `cursor-agent` / `agent`, `codex`, `opencode`
-- `gh` (opcional, para abrir PR)
+- At least one supported harness on `PATH`: `claude` / `claude-w`, `cursor-agent` / `agent`, `codex`, `opencode`
+- `gh` (optional, needed to open pull requests)
 
-## Instalação
+## Installation
 
 ```bash
 git clone git@github.com:pedrosatin/swarm-pr.git ~/Work/personal/swarm-pr
 ln -sfn ~/Work/personal/swarm-pr/swarm-pr ~/.local/bin/swarm-pr
 ```
 
-## Uso
+## Usage
 
 ```bash
-swarm-pr "implementa X"
-swarm-pr --max-iter 5 "implementa X"
-swarm-pr -y --max-iter 3 "implementa X"
-swarm-pr --skip-initial "só revisa o que já está na branch"
+swarm-pr "implement X"
+swarm-pr --max-iter 5 "implement X"
+swarm-pr -y --max-iter 3 "implement X"
+swarm-pr --skip-initial "just review what's already on the branch"
 ```
+
+Without `-y`/`--yes`, Swarm-PR interactively asks which harness, model, and reasoning effort to use for the coder and the reviewer roles.
 
 ### Flags
 
-| Flag | Descrição |
-|------|-----------|
-| `--branch` | Nome da branch (padrão: `swarm/<task-slug>`) |
-| `--base` | Branch base (padrão: main/master detectado) |
-| `--max-iter` | Máximo de ciclos Coder↔Reviewer (padrão: 3) |
-| `--skip-initial` | Pula implementação inicial e começa no review |
-| `-y`, `--yes` | Aceita defaults sem prompts interativos |
+| Flag | Description |
+|------|-------------|
+| `--branch` | Git branch name (default: `swarm/<task-slug>`) |
+| `--base` | Base branch (default: auto-detected `main`/`master`) |
+| `--max-iter` | Maximum number of Coder ↔ Reviewer cycles (default: 3) |
+| `--skip-initial` | Skip the initial implementation step and start directly at review |
+| `-y`, `--yes` | Accept defaults without interactive prompts |
 
 ## Config
 
-Última escolha de harness/modelo fica em:
+The last harness/model choice is stored at:
 
 ```text
 ~/.config/swarm-pr/last_config.json
 ```
 
-Esse arquivo é local ao usuário e **não** entra no repositório.
+This file is local to the user and is not part of the repository.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
