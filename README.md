@@ -2,6 +2,8 @@
 
 An autonomous Coder ↔ Reviewer loop with context isolation (SwarmForge-style).
 
+Criado por [@pedrosatin](https://github.com/pedrosatin)
+
 Swarm-PR picks a harness, model, and reasoning effort dynamically from whichever CLIs are installed on your machine. It streams the agents' progress live and checks the Git/PR state before opening a pull request.
 
 ## How it works
@@ -65,6 +67,10 @@ The last harness/model choice is stored at:
 ```
 
 This file is local to the user and is not part of the repository.
+
+## Contributing
+
+Report bugs and suggest contributions at https://github.com/pedrosatin/swarm-pr/issues.
 
 ## License
 
