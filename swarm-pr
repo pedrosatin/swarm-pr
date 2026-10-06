@@ -10,9 +10,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 
 # Desativa timeout de tarefas em background no Claude Code
 os.environ["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"
@@ -121,11 +123,34 @@ def save_last_config(cfg):
 # Execução com Live Streaming e UI em Tempo Real
 # ==============================================================================
 
-def stream_agent_execution(cmd, harness_name, is_claude_json=False, cwd=None, environment=None):
+class AgentTimeout(RuntimeError):
+    """O processo do agente excedeu o tempo limite e foi encerrado."""
+
+
+def _print_stderr_lines(stream, harness_name):
+    for line in stream:
+        line_clean = line.strip()
+        if line_clean:
+            print(f"{Colors.DIM}[{harness_name}:stderr] {line_clean}{Colors.RESET}", flush=True)
+
+
+def _kill_process_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def stream_agent_execution(cmd, harness_name, is_claude_json=False, cwd=None, environment=None,
+                           timeout=None, separate_stderr=False):
     """
     Executa o agente exibindo o progresso ao vivo na tela linha a linha.
     Para o Claude, decodifica o stream JSON para mostrar chamadas de ferramentas e pensamentos.
-    Retorna o texto final acumulado do agente.
+    Retorna o código de saída e o texto final do agente. No modo JSON do Claude, o texto final
+    é o campo `result` do evento `{"type": "result"}` (vazio se ele não chegar ou vier com erro).
+    Com `separate_stderr`, o stderr é exibido mas não entra no texto retornado.
+    Com `timeout` (segundos), o grupo de processos é encerrado ao estourar o prazo e
+    a função levanta AgentTimeout.
     """
     env = os.environ.copy() if environment is None else environment.copy()
     env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"
@@ -135,71 +160,114 @@ def stream_agent_execution(cmd, harness_name, is_claude_json=False, cwd=None, en
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
         text=True,
         bufsize=1,
         env=env,
         cwd=cwd,
+        start_new_session=timeout is not None,
     )
 
+    stderr_thread = None
+    if separate_stderr:
+        stderr_thread = threading.Thread(target=_print_stderr_lines, args=(proc.stderr, harness_name), daemon=True)
+        stderr_thread.start()
+
+    timed_out = threading.Event()
+    timer = None
+    if timeout is not None:
+        def expire():
+            timed_out.set()
+            _kill_process_group(proc)
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        timer.start()
+
     accumulated_text = []
+    final_result = None
 
-    for line in proc.stdout:
-        line_clean = line.strip()
-        if not line_clean:
-            continue
-
-        if is_claude_json and line_clean.startswith("{") and line_clean.endswith("}"):
-            try:
-                data = json.loads(line_clean)
-                event_type = data.get("type")
-
-                if event_type == "assistant":
-                    msg = data.get("message", {})
-                    for c in msg.get("content", []):
-                        ct = c.get("type")
-                        if ct == "tool_use":
-                            tool_name = c.get("name", "Tool")
-                            inp = c.get("input", {})
-                            if tool_name == "Bash":
-                                cmd_run = inp.get("command", "")
-                                print(f"{Colors.YELLOW}⚙️  [{harness_name}] ❯ {cmd_run[:120]}{Colors.RESET}", flush=True)
-                            elif tool_name in ["Edit", "Write"]:
-                                path = inp.get("file_path", "")
-                                print(f"{Colors.BLUE}📝 [{harness_name}] Editando: {path}{Colors.RESET}", flush=True)
-                            elif tool_name == "Read":
-                                path = inp.get("file_path", "")
-                                print(f"{Colors.DIM}📖 [{harness_name}] Lendo: {path}{Colors.RESET}", flush=True)
-                            else:
-                                print(f"{Colors.CYAN}🔧 [{harness_name}: {tool_name}] {str(inp)[:80]}{Colors.RESET}", flush=True)
-                        elif ct == "text":
-                            txt = c.get("text", "")
-                            accumulated_text.append(txt)
-                            print(f"{Colors.GREEN}💬 [{harness_name}]{Colors.RESET} {txt}", flush=True)
-
-                elif event_type == "user":
-                    msg = data.get("message", {})
-                    for c in msg.get("content", []):
-                        if c.get("type") == "tool_result":
-                            res_str = str(c.get("content", ""))
-                            first_line = res_str.splitlines()[0] if res_str else ""
-                            if first_line:
-                                print(f"{Colors.DIM}   └─ {first_line[:100]}{Colors.RESET}", flush=True)
-
-                elif event_type == "system" and data.get("subtype") == "thinking_tokens":
-                    # Indicador de raciocínio
-                    print(f"{Colors.DIM}💭 [{harness_name}] Raciocinando...{Colors.RESET}", end="\r", flush=True)
-
+    try:
+        for line in proc.stdout:
+            line_clean = line.strip()
+            if not line_clean:
                 continue
-            except Exception:
-                pass
 
-        # Linhas de texto comuns (ex: cursor-agent, codex ou fallback)
-        accumulated_text.append(line)
-        print(f"{Colors.DIM}[{harness_name}]{Colors.RESET} {line_clean}", flush=True)
+            if is_claude_json and line_clean.startswith("{") and line_clean.endswith("}"):
+                try:
+                    data = json.loads(line_clean)
+                    event_type = data.get("type")
 
-    proc.wait()
+                    if event_type == "assistant":
+                        msg = data.get("message", {})
+                        for c in msg.get("content", []):
+                            ct = c.get("type")
+                            if ct == "tool_use":
+                                tool_name = c.get("name", "Tool")
+                                inp = c.get("input", {})
+                                if tool_name == "Bash":
+                                    cmd_run = inp.get("command", "")
+                                    print(f"{Colors.YELLOW}⚙️  [{harness_name}] ❯ {cmd_run[:120]}{Colors.RESET}", flush=True)
+                                elif tool_name in ["Edit", "Write"]:
+                                    path = inp.get("file_path", "")
+                                    print(f"{Colors.BLUE}📝 [{harness_name}] Editando: {path}{Colors.RESET}", flush=True)
+                                elif tool_name == "Read":
+                                    path = inp.get("file_path", "")
+                                    print(f"{Colors.DIM}📖 [{harness_name}] Lendo: {path}{Colors.RESET}", flush=True)
+                                else:
+                                    print(f"{Colors.CYAN}🔧 [{harness_name}: {tool_name}] {str(inp)[:80]}{Colors.RESET}", flush=True)
+                            elif ct == "text":
+                                txt = c.get("text", "")
+                                accumulated_text.append(txt)
+                                print(f"{Colors.GREEN}💬 [{harness_name}]{Colors.RESET} {txt}", flush=True)
+
+                    elif event_type == "user":
+                        msg = data.get("message", {})
+                        for c in msg.get("content", []):
+                            if c.get("type") == "tool_result":
+                                res_str = str(c.get("content", ""))
+                                first_line = res_str.splitlines()[0] if res_str else ""
+                                if first_line:
+                                    print(f"{Colors.DIM}   └─ {first_line[:100]}{Colors.RESET}", flush=True)
+
+                    elif event_type == "result":
+                        result = data.get("result")
+                        if not data.get("is_error") and isinstance(result, str):
+                            final_result = result
+
+                    elif event_type == "system" and data.get("subtype") == "thinking_tokens":
+                        # Indicador de raciocínio
+                        print(f"{Colors.DIM}💭 [{harness_name}] Raciocinando...{Colors.RESET}", end="\r", flush=True)
+
+                    continue
+                except Exception:
+                    pass
+
+            # Linhas de texto comuns (ex: cursor-agent, codex ou fallback)
+            if not is_claude_json:
+                accumulated_text.append(line)
+            print(f"{Colors.DIM}[{harness_name}]{Colors.RESET} {line_clean}", flush=True)
+
+        proc.wait()
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if proc.poll() is None:
+            if timeout is not None:
+                _kill_process_group(proc)
+            else:
+                proc.kill()
+            proc.wait()
+        proc.stdout.close()
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=5)
+            if not stderr_thread.is_alive():
+                proc.stderr.close()
+
     print(f"{Colors.DIM}└── Processo encerrado (código: {proc.returncode}){Colors.RESET}\n", flush=True)
+    if timed_out.is_set():
+        raise AgentTimeout(f"{harness_name} excedeu o tempo limite de {timeout:g} s e foi encerrado.")
+    if is_claude_json:
+        return proc.returncode, (final_result or "").strip()
     return proc.returncode, "".join(accumulated_text).strip()
 
 # ==============================================================================
@@ -522,7 +590,10 @@ def configure_agent_role(role_name, default_harness, harnesses, last_cfg):
 
     saved_harness = last_cfg.get(f"{role_name}_harness", default_harness)
     if saved_harness not in harnesses:
-        saved_harness = list(harnesses.keys())[0]
+        if f"{role_name}_harness" in last_cfg:
+            log("⚠️", f"O harness salvo '{saved_harness}' não está disponível para {role_name}; modelo e effort salvos serão ignorados.")
+            last_cfg = {}
+        saved_harness = default_harness if default_harness in harnesses else list(harnesses.keys())[0]
 
     harness_list = list(harnesses.keys())
     print(f"\n{Colors.BOLD}{Colors.CYAN}Selecione o Harness/CLI para {role_name}:{Colors.RESET}")
@@ -665,56 +736,93 @@ INSTRUÇÕES CRÍTICAS DE EXECUÇÃO:
         log("❌", f"{harness} encerrou com erro ({retcode}) na implementação.")
         sys.exit(retcode)
 
+# Harnesses com restrições de ferramentas verificadas para o papel de reviewer.
+REVIEWER_HARNESSES = ["claude-w", "claude", "codex"]
+CLAUDE_HARNESSES = ["claude-w", "claude"]
+DEFAULT_REVIEW_TIMEOUT_MINUTES = 15
+MAX_REVIEW_RESPONSE_CHARS = 100000
+
+# Recursos opcionais do Codex desligados no reviewer. Todos mudam para false em
+# `codex -c features.<nome>=false features list` (codex-cli 0.160.1).
+# `unified_exec` fica de fora: o override não muda o valor efetivo.
+CODEX_REVIEWER_DISABLED_FEATURES = [
+    "shell_tool", "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+    "computer_use", "in_app_browser", "image_generation", "multi_agent", "plugins",
+    "remote_plugin", "hooks", "code_mode_host", "view_image", "artifact", "skill_search",
+    "tool_suggest", "sleep_tool",
+]
+
+REVIEWER_ENV_COMMON = {
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+}
+REVIEWER_ENV_PREFIXES = ("MISE_", "__MISE_")
+REVIEWER_ENV_CLAUDE = {
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "AWS_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
+}
+REVIEWER_ENV_CODEX = {"OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"}
+
+
+def validate_reviewer_harness(harness):
+    if harness not in REVIEWER_HARNESSES:
+        raise ValueError(
+            f"O harness '{harness}' não pode ser reviewer: as restrições de ferramentas dele não foram verificadas. "
+            "Use Claude (claude-w/claude) ou Codex."
+        )
+
+
 def reviewer_command(reviewer_cfg, prompt, final_output_path=None):
     harness = reviewer_cfg['harness']
     binary = reviewer_cfg['binary']
     model = reviewer_cfg['model']
     effort = reviewer_cfg['effort']
-    if harness in ['claude-w', 'claude']:
+    validate_reviewer_harness(harness)
+    if harness in CLAUDE_HARNESSES:
         cmd = [binary, '--safe-mode', '--tools', '', '--strict-mcp-config',
                '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands',
                '--no-session-persistence', '--verbose', '--output-format', 'stream-json',
                '-p', prompt, '--model', model]
-    elif harness == 'codex':
+        if effort != 'default':
+            cmd += ['--effort', effort]
+    else:
         cmd = [binary, 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral',
                '--skip-git-repo-check', '-s', 'read-only', '-m', model,
                '-c', 'approval_policy="never"', '-c', 'web_search="disabled"']
-        for feature in ['shell_tool', 'unified_exec', 'apps', 'browser_use', 'computer_use',
-                        'in_app_browser', 'image_generation', 'multi_agent', 'plugins',
-                        'hooks', 'code_mode_host', 'view_image', 'artifact', 'skill_search']:
+        for feature in CODEX_REVIEWER_DISABLED_FEATURES:
             cmd += ['-c', f'features.{feature}=false']
         if final_output_path is not None:
             cmd += ['--output-last-message', final_output_path]
         cmd.append(prompt)
-    else:
-        raise ValueError(f'Review mode for {harness} has no verified restrictions. Choose Claude or Codex.')
-    if effort != 'default' and harness in ['claude-w', 'claude']:
-        cmd += ['--effort', effort]
-    elif effort != 'default' and harness == 'codex':
-        cmd += ['-c', f'model_reasoning_effort={effort}']
+        if effort != 'default':
+            cmd += ['-c', f'model_reasoning_effort={effort}']
     return cmd
 
 
-def reviewer_environment(harness):
-    allowed = {'PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'SSL_CERT_FILE', 'SSL_CERT_DIR'}
-    if harness in ['claude-w', 'claude']:
-        allowed.update({'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_BASE_URL'})
+def reviewer_environment(harness, source=None):
+    source = os.environ if source is None else source
+    allowed = set(REVIEWER_ENV_COMMON)
+    if harness in CLAUDE_HARNESSES:
+        allowed |= REVIEWER_ENV_CLAUDE
     elif harness == 'codex':
-        allowed.update({'OPENAI_API_KEY', 'CODEX_HOME'})
-    elif harness in ['cursor-agent', 'agent']:
-        allowed.add('CURSOR_API_KEY')
-    return {name: value for name, value in os.environ.items() if name in allowed}
+        allowed |= REVIEWER_ENV_CODEX
+    return {name: value for name, value in source.items()
+            if name in allowed or name.startswith(REVIEWER_ENV_PREFIXES)}
 
 
 def review_approved(output):
     return output.strip() == "STATUS: APPROVED"
 
 
-def dispatch_reviewer(reviewer_cfg, task_description, diff_content):
+def dispatch_reviewer(reviewer_cfg, task_description, diff_content,
+                      timeout_minutes=DEFAULT_REVIEW_TIMEOUT_MINUTES):
     harness = reviewer_cfg["harness"]
-    binary = reviewer_cfg["binary"]
     model = reviewer_cfg["model"]
     effort = reviewer_cfg["effort"]
+    validate_reviewer_harness(harness)
 
     log("🔍", f"[{harness}] Realizando code review com modelo '{model}' (effort={effort})...")
 
@@ -744,22 +852,28 @@ STATUS: APPROVED
 STATUS: CHANGES_REQUESTED
 - [Arquivo:Linha]: <problema específico e recomendação objetiva>
 """
+    is_claude = harness in CLAUDE_HARNESSES
     with tempfile.TemporaryDirectory(prefix='swarm-review-') as directory:
         final_output_path = os.path.join(directory, 'final-response.txt')
         cmd = reviewer_command(reviewer_cfg, prompt, final_output_path)
-        status, output = stream_agent_execution(cmd, harness,
-                                               is_claude_json=harness in ['claude-w', 'claude'],
-                                               cwd=directory, environment=reviewer_environment(harness))
+        try:
+            status, output = stream_agent_execution(cmd, harness, is_claude_json=is_claude,
+                                                    cwd=directory, environment=reviewer_environment(harness),
+                                                    timeout=timeout_minutes * 60, separate_stderr=True)
+        except AgentTimeout as error:
+            raise RuntimeError(f'{error} A revisão não pode ser aprovada.') from None
         if status != 0:
-            raise RuntimeError(f'Reviewer exited with status {status}; review cannot be approved.')
+            raise RuntimeError(f'O reviewer terminou com código {status}; a revisão não pode ser aprovada.')
         if harness == 'codex':
             try:
                 with open(final_output_path, encoding='utf-8') as response:
-                    output = response.read(100001)
+                    output = response.read(MAX_REVIEW_RESPONSE_CHARS + 1)
             except (OSError, UnicodeError):
-                raise RuntimeError('Reviewer produced no readable final response; review cannot be approved.') from None
-            if len(output) > 100000:
-                raise RuntimeError('Reviewer final response exceeds the limit; review cannot be approved.')
+                raise RuntimeError('O reviewer não gerou uma resposta final legível; a revisão não pode ser aprovada.') from None
+        elif not output:
+            raise RuntimeError('O reviewer não enviou o evento final de resultado; a revisão não pode ser aprovada.')
+        if len(output) > MAX_REVIEW_RESPONSE_CHARS:
+            raise RuntimeError('A resposta final do reviewer excede o limite de tamanho; a revisão não pode ser aprovada.')
     return output
 
 def dispatch_refiner(coder_cfg, review_feedback, task_description, branch_name):
@@ -873,6 +987,29 @@ def ensure_pr_exists(task_description, branch_name, base_branch):
         log("❌", f"Falha ao criar PR via gh CLI: {e}")
         return None
 
+def default_model_for(harness):
+    if harness in CLAUDE_HARNESSES:
+        return "sonnet"
+    if harness == "codex":
+        return fetch_codex_default_model()
+    if harness == "opencode":
+        return "opencode-go/grok-4.6"
+    return "cursor-grok-4.6"
+
+
+def saved_role_config(role_name, default_harness, harnesses, last_cfg):
+    """Monta a configuração de um papel no modo -y a partir do last_config.json."""
+    harness = last_cfg.get(f"{role_name}_harness", default_harness)
+    if harness not in harnesses:
+        raise ValueError(f"o harness salvo para {role_name} ('{harness}') não foi encontrado no PATH.")
+    saved = last_cfg if f"{role_name}_harness" in last_cfg else {}
+    return {
+        "harness": harness,
+        "binary": harnesses[harness],
+        "model": saved.get(f"{role_name}_model") or default_model_for(harness),
+        "effort": saved.get(f"{role_name}_effort", "medium"),
+    }
+
 # ==============================================================================
 # Loop Principal
 # ==============================================================================
@@ -886,9 +1023,13 @@ def main():
     parser.add_argument("--base", help="Branch base (padrão: detecta main/master)")
     parser.add_argument("--max-iter", type=int, default=3, help="Máximo de ciclos de review (padrão: 3)")
     parser.add_argument("--skip-initial", action="store_true", help="Pular implementação inicial e iniciar direto pelo review")
+    parser.add_argument("--review-timeout", type=float, default=DEFAULT_REVIEW_TIMEOUT_MINUTES,
+                        help=f"Tempo máximo de cada revisão em minutos (padrão: {DEFAULT_REVIEW_TIMEOUT_MINUTES})")
     parser.add_argument("-y", "--yes", action="store_true", help="Aceitar defaults automaticamente sem perguntas interativas")
 
     args = parser.parse_args()
+    if args.review_timeout <= 0:
+        parser.error("--review-timeout deve ser maior que zero")
 
     if not is_git_repo():
         log("❌", "Erro: O comando deve ser executado dentro de um repositório Git.")
@@ -911,11 +1052,17 @@ def main():
             sys.exit(1)
 
     last_cfg = load_last_config()
+    reviewer_harnesses = {k: v for k, v in harnesses.items() if k in REVIEWER_HARNESSES}
+    if not reviewer_harnesses:
+        log("❌", "Nenhum harness compatível com o papel de reviewer foi encontrado. Instale Claude Code (claude-w/claude) ou Codex.")
+        sys.exit(2)
+    def_c = "claude-w" if "claude-w" in harnesses else list(harnesses.keys())[0]
+    def_r = "codex" if "codex" in reviewer_harnesses else list(reviewer_harnesses.keys())[0]
 
     if not args.yes and sys.stdin.isatty():
-        coder_cfg = configure_agent_role("coder", "claude-w", harnesses, last_cfg)
-        reviewer_cfg = configure_agent_role("reviewer", "cursor-agent", harnesses, last_cfg)
-        
+        coder_cfg = configure_agent_role("coder", def_c, harnesses, last_cfg)
+        reviewer_cfg = configure_agent_role("reviewer", def_r, reviewer_harnesses, last_cfg)
+
         save_last_config({
             "coder_harness": coder_cfg["harness"],
             "coder_model": coder_cfg["model"],
@@ -925,23 +1072,14 @@ def main():
             "reviewer_effort": reviewer_cfg["effort"]
         })
     else:
-        def_c = "claude-w" if "claude-w" in harnesses else list(harnesses.keys())[0]
-        def_r = "cursor-agent" if "cursor-agent" in harnesses else list(harnesses.keys())[0]
-        
-        c_h = last_cfg.get("coder_harness", def_c)
-        coder_cfg = {
-            "harness": c_h,
-            "binary": harnesses[c_h],
-            "model": last_cfg.get("coder_model", "sonnet" if c_h == "claude-w" else "cursor-grok-4.6"),
-            "effort": last_cfg.get("coder_effort", "medium")
-        }
-        r_h = last_cfg.get("reviewer_harness", def_r)
-        reviewer_cfg = {
-            "harness": r_h,
-            "binary": harnesses[r_h],
-            "model": last_cfg.get("reviewer_model", "cursor-grok-4.6" if r_h == "cursor-agent" else "sonnet"),
-            "effort": last_cfg.get("reviewer_effort", "medium")
-        }
+        try:
+            coder_cfg = saved_role_config("coder", def_c, harnesses, last_cfg)
+            reviewer_cfg = saved_role_config("reviewer", def_r, harnesses, last_cfg)
+            validate_reviewer_harness(reviewer_cfg["harness"])
+        except ValueError as error:
+            log("❌", f"Configuração inválida: {error}")
+            log("👉", f"Rode sem -y para escolher outro harness ou edite {CONFIG_FILE}.")
+            sys.exit(2)
 
     base_branch = args.base or get_default_branch()
     branch_name = args.branch or f"swarm/{slugify(task)}"
@@ -979,7 +1117,12 @@ def main():
             log("⚠️", "Nenhum diff encontrado em relação à branch base. Encerrando.")
             break
 
-        review_result = dispatch_reviewer(reviewer_cfg, task, diff)
+        try:
+            review_result = dispatch_reviewer(reviewer_cfg, task, diff, args.review_timeout)
+        except (ValueError, RuntimeError) as error:
+            log("❌", f"Falha na revisão: {error}")
+            log("👉", "O PR não foi aprovado. Verifique o reviewer e rode novamente com --skip-initial.")
+            sys.exit(1)
 
         print(f"\n------------------- Feedback do {reviewer_cfg['harness']} -------------------")
         print(review_result.strip())
