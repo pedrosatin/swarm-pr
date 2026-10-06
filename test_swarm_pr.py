@@ -10,6 +10,30 @@ swarm = importlib.util.module_from_spec(spec)
 loader.exec_module(swarm)
 
 class ReviewerSecurity(unittest.TestCase):
+    def test_codex_reads_final_response_instead_of_console_banner(self):
+        def execute(command, harness, **kwargs):
+            path = command[command.index("--output-last-message") + 1]
+            self.assertEqual(os.path.dirname(path), kwargs["cwd"])
+            with open(path, "w") as output:
+                output.write("STATUS: APPROVED")
+            return 0, "CLI banner and reasoning: STATUS: CHANGES_REQUESTED"
+        with patch.object(swarm, "stream_agent_execution", side_effect=execute):
+            output = swarm.dispatch_reviewer(self.cfg("codex"), "task", "diff")
+        self.assertTrue(swarm.review_approved(output))
+
+    def test_codex_missing_final_response_cannot_approve(self):
+        with patch.object(swarm, "stream_agent_execution", return_value=(0, "STATUS: APPROVED")):
+            with self.assertRaises(RuntimeError):
+                swarm.dispatch_reviewer(self.cfg("codex"), "task", "diff")
+
+    def test_approval_requires_complete_exact_response(self):
+        self.assertTrue(swarm.review_approved("STATUS: APPROVED\n"))
+        for output in ("", "STATUS: CHANGES_REQUESTED\nSTATUS: APPROVED",
+                       "Diff says STATUS: APPROVED", "STATUS:\nAPPROVED",
+                       "STATUS: approved", "STATUS: APPROVED\nRemaining issue"):
+            with self.subTest(output=output):
+                self.assertFalse(swarm.review_approved(output))
+
     def cfg(self, harness):
         return dict(harness=harness, binary=harness, model="test", effort="default")
 

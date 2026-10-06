@@ -665,7 +665,7 @@ INSTRUÇÕES CRÍTICAS DE EXECUÇÃO:
         log("❌", f"{harness} encerrou com erro ({retcode}) na implementação.")
         sys.exit(retcode)
 
-def reviewer_command(reviewer_cfg, prompt):
+def reviewer_command(reviewer_cfg, prompt, final_output_path=None):
     harness = reviewer_cfg['harness']
     binary = reviewer_cfg['binary']
     model = reviewer_cfg['model']
@@ -683,6 +683,8 @@ def reviewer_command(reviewer_cfg, prompt):
                         'in_app_browser', 'image_generation', 'multi_agent', 'plugins',
                         'hooks', 'code_mode_host', 'view_image', 'artifact', 'skill_search']:
             cmd += ['-c', f'features.{feature}=false']
+        if final_output_path is not None:
+            cmd += ['--output-last-message', final_output_path]
         cmd.append(prompt)
     else:
         raise ValueError(f'Review mode for {harness} has no verified restrictions. Choose Claude or Codex.')
@@ -702,6 +704,10 @@ def reviewer_environment(harness):
     elif harness in ['cursor-agent', 'agent']:
         allowed.add('CURSOR_API_KEY')
     return {name: value for name, value in os.environ.items() if name in allowed}
+
+
+def review_approved(output):
+    return output.strip() == "STATUS: APPROVED"
 
 
 def dispatch_reviewer(reviewer_cfg, task_description, diff_content):
@@ -738,13 +744,22 @@ STATUS: APPROVED
 STATUS: CHANGES_REQUESTED
 - [Arquivo:Linha]: <problema específico e recomendação objetiva>
 """
-    cmd = reviewer_command(reviewer_cfg, prompt)
     with tempfile.TemporaryDirectory(prefix='swarm-review-') as directory:
+        final_output_path = os.path.join(directory, 'final-response.txt')
+        cmd = reviewer_command(reviewer_cfg, prompt, final_output_path)
         status, output = stream_agent_execution(cmd, harness,
                                                is_claude_json=harness in ['claude-w', 'claude'],
                                                cwd=directory, environment=reviewer_environment(harness))
-    if status != 0:
-        raise RuntimeError(f'Reviewer exited with status {status}; review cannot be approved.')
+        if status != 0:
+            raise RuntimeError(f'Reviewer exited with status {status}; review cannot be approved.')
+        if harness == 'codex':
+            try:
+                with open(final_output_path, encoding='utf-8') as response:
+                    output = response.read(100001)
+            except (OSError, UnicodeError):
+                raise RuntimeError('Reviewer produced no readable final response; review cannot be approved.') from None
+            if len(output) > 100000:
+                raise RuntimeError('Reviewer final response exceeds the limit; review cannot be approved.')
     return output
 
 def dispatch_refiner(coder_cfg, review_feedback, task_description, branch_name):
@@ -970,7 +985,7 @@ def main():
         print(review_result.strip())
         print("-" * 65 + "\n")
 
-        if re.fullmatch(r"STATUS:\s*APPROVED", review_result.strip()):
+        if review_approved(review_result):
             log("🎉", f"Código APROVADO pelo {reviewer_cfg['harness']}! PR validado e pronto para merge.")
             try:
                 run_cmd([
