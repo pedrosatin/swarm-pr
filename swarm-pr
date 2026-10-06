@@ -675,8 +675,6 @@ def reviewer_command(reviewer_cfg, prompt):
                '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands',
                '--no-session-persistence', '--verbose', '--output-format', 'stream-json',
                '-p', prompt, '--model', model]
-    elif harness in ['cursor-agent', 'agent']:
-        cmd = [binary, '-p', '--mode', 'ask', '--sandbox', 'enabled', '--model', model, prompt]
     elif harness == 'codex':
         cmd = [binary, 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral',
                '--skip-git-repo-check', '-s', 'read-only', '-m', model,
@@ -687,7 +685,7 @@ def reviewer_command(reviewer_cfg, prompt):
             cmd += ['-c', f'features.{feature}=false']
         cmd.append(prompt)
     else:
-        raise ValueError(f'Review mode for {harness} has no verified restrictions. Choose Claude, Codex or Cursor.')
+        raise ValueError(f'Review mode for {harness} has no verified restrictions. Choose Claude or Codex.')
     if effort != 'default' and harness in ['claude-w', 'claude']:
         cmd += ['--effort', effort]
     elif effort != 'default' and harness == 'codex':

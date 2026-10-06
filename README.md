@@ -78,7 +78,7 @@ MIT, see [LICENSE](LICENSE).
 
 ## Reviewer restrictions
 
-Reviewers receive a bounded diff as a quoted JSON string in an empty temporary directory. Claude runs with tools, MCP servers and custom commands disabled. Codex ignores user configuration and repository rules, uses a read-only sandbox, and disables shell execution, web search and optional integrations. Cursor uses ask mode with its sandbox enabled. OpenCode review is refused because a restricted review mode has not been verified. Coder and refiner permissions remain explicit implementation permissions.
+Reviewers receive a bounded diff as a quoted JSON string in an empty temporary directory. Claude runs with tools, MCP servers and custom commands disabled. Codex ignores user configuration and repository rules, uses a read-only sandbox, and disables shell execution, web search and optional integrations. Cursor and OpenCode review are refused because restrictions on file and network tools have not been verified. Coder and refiner permissions remain explicit implementation permissions.
 
 A failed reviewer cannot approve a change. Approval requires the complete response to be exactly `STATUS: APPROVED`. Review processes receive only transport settings and credentials for their selected provider. These controls reduce prompt-injection impact; model review still requires human judgement.
 

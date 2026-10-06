@@ -27,11 +27,10 @@ class ReviewerSecurity(unittest.TestCase):
         self.assertIn("features.unified_exec=false", command)
         self.assertIn("web_search=\"disabled\"", command)
         self.assertIn("--ignore-user-config", command)
-        cursor = swarm.reviewer_command(self.cfg("agent"), "diff")
-        self.assertEqual(cursor[cursor.index("--mode") + 1], "ask")
-        self.assertNotIn("--force", cursor)
         with self.assertRaises(ValueError):
             swarm.reviewer_command(self.cfg("opencode"), "diff")
+        with self.assertRaises(ValueError):
+            swarm.reviewer_command(self.cfg("agent"), "diff")
 
     def test_execution_isolated_and_failure_cannot_approve(self):
         def execute(command, harness, **kwargs):
