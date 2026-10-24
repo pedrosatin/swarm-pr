@@ -362,15 +362,21 @@ def branch_foreign_identities(base_branch):
     ref = _resolve_base_ref(base_branch)
     if not email or not ref:
         return None
-    res = subprocess.run(["git", "log", "--format=%ae%x00%ce", f"{ref}..HEAD"], capture_output=True, text=True)
+    res = subprocess.run(["git", "log", "--format=%ae%x00%ce%x00%G?", f"{ref}..HEAD"], capture_output=True, text=True)
     if res.returncode != 0:
         return None
     foreign = set()
     for line in res.stdout.splitlines():
-        for identity in line.split("\0"):
-            identity = identity.strip()
-            if identity and identity.lower() != email:
-                foreign.add(identity)
+        parts = line.split("\0")
+        author = parts[0].strip().lower() if len(parts) > 0 else ""
+        committer = parts[1].strip().lower() if len(parts) > 1 else ""
+        sig = parts[2].strip() if len(parts) > 2 else ""
+        if sig == "B":
+            foreign.add(f"bad-signature:{author or committer}")
+        if author and author != email:
+            foreign.add(author)
+        if committer and committer != email:
+            foreign.add(committer)
     return sorted(foreign)
 
 
@@ -1026,6 +1032,30 @@ def configure_agent_role(role_name, default_harness, harnesses, last_cfg):
 # Execução dos Agentes com Streaming
 # ==============================================================================
 
+def coder_command(coder_cfg):
+    """Monta o comando do coder/refiner. O prompt vai pelo stdin, nunca pelo argv."""
+    harness = coder_cfg["harness"]
+    binary = coder_cfg["binary"]
+    model = coder_cfg["model"]
+    effort = coder_cfg["effort"]
+    if harness in ["claude-w", "claude"]:
+        cmd = [binary, "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json", "-p", "--model", model]
+        if effort != "default":
+            cmd += ["--effort", effort]
+    elif harness in ["cursor-agent", "agent"]:
+        cmd = [binary, "-p", "--force", "--model", model, "-"]
+    elif harness == "codex":
+        cmd = [binary, "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", model]
+        if effort != "default":
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
+        cmd.append("-")
+    elif harness == "opencode":
+        cmd = [binary, "run", "--auto", "-m", model, "-"]
+    else:
+        cmd = [binary, "-"]
+    return cmd
+
+
 def dispatch_coder(coder_cfg, task_description, branch_name):
     harness = coder_cfg["harness"]
     binary = coder_cfg["binary"]
@@ -1046,24 +1076,9 @@ INSTRUÇÕES CRÍTICAS DE EXECUÇÃO:
    (arquivos rastreados e arquivos novos não sensíveis) e o push para a branch {branch_name}.
 5. Não crie arquivos com segredos ou credenciais (.env, chaves, certificados).
 """
+    cmd = coder_command(coder_cfg)
     is_claude = harness in ["claude-w", "claude"]
-    if is_claude:
-        cmd = [binary, "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json", "-p", prompt, "--model", model]
-        if effort != "default":
-            cmd += ["--effort", effort]
-    elif harness in ["cursor-agent", "agent"]:
-        cmd = [binary, "-p", "--force", "--model", model, prompt]
-    elif harness == "codex":
-        cmd = [binary, "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", model]
-        if effort != "default":
-            cmd += ["-c", f"model_reasoning_effort={effort}"]
-        cmd.append(prompt)
-    elif harness == "opencode":
-        cmd = [binary, "run", "--auto", "-m", model, prompt]
-    else:
-        cmd = [binary, prompt]
-
-    retcode, _ = stream_agent_execution(cmd, harness, is_claude_json=is_claude)
+    retcode, _ = stream_agent_execution(cmd, harness, is_claude_json=is_claude, input_text=prompt)
     if retcode != 0:
         log("❌", f"{harness} encerrou com erro ({retcode}) na implementação.")
         sys.exit(retcode)
@@ -1089,7 +1104,10 @@ REVIEWER_ENV_COMMON = {
     "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
     "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
 }
-REVIEWER_ENV_PREFIXES = ("MISE_", "__MISE_")
+REVIEWER_ENV_MISE_SAFE = {
+    "MISE_SHELL", "__MISE_SESSION", "__MISE_DIFF", "MISE_ENV",
+    "MISE_DATA_DIR", "MISE_CONFIG_DIR", "MISE_CACHE_DIR", "MISE_BIN",
+}
 REVIEWER_ENV_CLAUDE = {
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
@@ -1137,13 +1155,13 @@ def reviewer_command(reviewer_cfg, final_output_path=None):
 
 def reviewer_environment(harness, source=None):
     source = os.environ if source is None else source
-    allowed = set(REVIEWER_ENV_COMMON)
+    allowed = set(REVIEWER_ENV_COMMON) | REVIEWER_ENV_MISE_SAFE
     if harness in CLAUDE_HARNESSES:
         allowed |= REVIEWER_ENV_CLAUDE
     elif harness == 'codex':
         allowed |= REVIEWER_ENV_CODEX
     return {name: value for name, value in source.items()
-            if name in allowed or name.startswith(REVIEWER_ENV_PREFIXES)}
+            if name in allowed}
 
 
 def review_approved(output):
@@ -1281,24 +1299,9 @@ def dispatch_refiner(coder_cfg, review_feedback, task_description, branch_name, 
     log("🛠️", f"[{harness}] Avaliando apontamentos e aplicando correções...")
 
     prompt = build_refiner_prompt(review_feedback, task_description, source)
+    cmd = coder_command(coder_cfg)
     is_claude = harness in ["claude-w", "claude"]
-    if is_claude:
-        cmd = [binary, "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json", "-p", prompt, "--model", model]
-        if effort != "default":
-            cmd += ["--effort", effort]
-    elif harness in ["cursor-agent", "agent"]:
-        cmd = [binary, "-p", "--force", "--model", model, prompt]
-    elif harness == "codex":
-        cmd = [binary, "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", model]
-        if effort != "default":
-            cmd += ["-c", f"model_reasoning_effort={effort}"]
-        cmd.append(prompt)
-    elif harness == "opencode":
-        cmd = [binary, "run", "--auto", "-m", model, prompt]
-    else:
-        cmd = [binary, prompt]
-
-    retcode, _ = stream_agent_execution(cmd, harness, is_claude_json=is_claude)
+    retcode, _ = stream_agent_execution(cmd, harness, is_claude_json=is_claude, input_text=prompt)
     if retcode != 0:
         log("❌", f"{harness} encerrou com erro ao aplicar correções.")
         sys.exit(retcode)
